@@ -189,6 +189,26 @@ async function osrmRoute(coords){
 }
 function hvKm(a,b){const R=6371,dLat=((b.lat-a.lat)*Math.PI)/180,dLon=((b.lng-a.lng)*Math.PI)/180;const x=Math.sin(dLat/2)**2+Math.cos((a.lat*Math.PI)/180)*Math.cos((b.lat*Math.PI)/180)*Math.sin(dLon/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));}
 
+// ═══ NEAREST NEIGHBOR ORDERING ═══
+// Always goes to the closest unvisited stop — no drive-pasts
+function nearestNeighborOrder(depot, stops) {
+  var remaining = stops.slice();
+  var ordered = [];
+  var current = depot;
+  while (remaining.length > 0) {
+    var bestIdx = 0;
+    var bestDist = Infinity;
+    for (var i = 0; i < remaining.length; i++) {
+      var d = hvKm(current, remaining[i].geocoded);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    ordered.push(remaining[bestIdx]);
+    current = remaining[bestIdx].geocoded;
+    remaining.splice(bestIdx, 1);
+  }
+  return ordered;
+}
+
 // ═══ LEAFLET MAP ═══
 function LeafletMap({stops,optimizedOrder,tripGeometry,unoptGeometry,depot}){
   const mapRef=useRef(null),mapInst=useRef(null),lg=useRef(null);
@@ -201,7 +221,6 @@ function LeafletMap({stops,optimizedOrder,tripGeometry,unoptGeometry,depot}){
     const list=optimizedOrder&&optimizedOrder.length>0?optimizedOrder:stops;
     const isOpt=optimizedOrder&&optimizedOrder.length>0;
     list.forEach((s,i)=>{if(!s.geocoded)return;const c=isOpt?"#10b981":"#475569";L.marker([s.geocoded.lat,s.geocoded.lng],{icon:mkI(`<div style="width:30px;height:30px;border-radius:50%;background:${c};border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.4)">${isOpt?i+1:"?"}</div>`)}).addTo(lg.current);bounds.push([s.geocoded.lat,s.geocoded.lng]);});
-    if(isOpt&&unoptGeometry&&unoptGeometry.coordinates)L.polyline(unoptGeometry.coordinates.map(c=>[c[1],c[0]]),{color:"#64748b",weight:3,opacity:0.5,dashArray:"8 6"}).addTo(lg.current);
     if(isOpt&&tripGeometry&&tripGeometry.coordinates)L.polyline(tripGeometry.coordinates.map(c=>[c[1],c[0]]),{color:"#f97316",weight:4,opacity:0.85}).addTo(lg.current);
     if(bounds.length>1)mapInst.current.fitBounds(bounds,{padding:[50,50],maxZoom:13});
   },[stops,optimizedOrder,tripGeometry,unoptGeometry,depot]);
@@ -215,11 +234,13 @@ function RouteMaster(){
   const [nextId,setNextId]=useState(3);
   const [vehicle, setVehicle] = useState("kia");
   const [diesel, setDiesel] = useState(DEFAULT_DIESEL);
+  const [routeMode, setRouteMode] = useState("nearest");
   const [loading,setLoading]=useState(false);
   const [globalError,setGlobalError]=useState(null);
   const [tripResult,setTripResult]=useState(null);
   const [unoptResult,setUnoptResult]=useState(null);
   const [optimizedOrder,setOptimizedOrder]=useState(null);
+  const [originalOrder,setOriginalOrder]=useState(null);
   const [tripGeometry,setTripGeometry]=useState(null);
   const [unoptGeometry,setUnoptGeometry]=useState(null);
   const [estimated,setEstimated]=useState(false);
@@ -239,28 +260,55 @@ function RouteMaster(){
     const valid=stops.filter(s=>s.geocoded);
     if(valid.length<2){setGlobalError(t("errNotGeo"));return;}
     setLoading(true);setGlobalError(null);setTripResult(null);setUnoptResult(null);setOptimizedOrder(null);setTripGeometry(null);setUnoptGeometry(null);setEstimated(false);
-    const all=[NCS_WAREHOUSE,...valid.map(s=>s.geocoded),NCS_WAREHOUSE];
+
+    // Sequential (as-entered) route for comparison
+    const seqCoords=[NCS_WAREHOUSE,...valid.map(s=>s.geocoded),NCS_WAREHOUSE];
+    var seqRoute = await osrmRoute(seqCoords);
+
     try{
-      const trip=await osrmTrip(all);
-      const unopt=await osrmRoute(all);
-      if(trip){
-        setTripResult({distanceKm:trip.distanceKm,durationSec:trip.durationSec});
-        setTripGeometry(trip.geometry);
-        const wpIdx=trip.waypoints.slice(1,-1).map(wp=>wp.waypoint_index-1);
-        const reord=wpIdx.map(i=>valid[i]).filter(Boolean);
-        setOptimizedOrder(reord.length>0?reord:valid);
-        if(unopt){setUnoptResult({distanceKm:unopt.distanceKm,durationSec:unopt.durationSec});if(unopt.geometry)setUnoptGeometry(unopt.geometry);}
-        else{let d=0;for(let i=0;i<all.length-1;i++)d+=hvKm(all[i],all[i+1])*1.3;setUnoptResult({distanceKm:parseFloat(d.toFixed(1)),durationSec:Math.round((d/70)*3600)});}
-      }else{
-        setEstimated(true);setGlobalError(t("errOSRM"));
-        let d=0;for(let i=0;i<all.length-1;i++)d+=hvKm(all[i],all[i+1])*1.3;const km=parseFloat(d.toFixed(1));
-        setTripResult({distanceKm:km,durationSec:Math.round((km/70)*3600)});
-        setOptimizedOrder(valid);
-        setUnoptResult({distanceKm:parseFloat((km*1.2).toFixed(1)),durationSec:Math.round(((km*1.2)/70)*3600)});
+      if (routeMode === "nearest") {
+        // NEAREST NEXT: greedy closest-stop ordering
+        var nnOrder = nearestNeighborOrder(NCS_WAREHOUSE, valid);
+        var nnCoords = [NCS_WAREHOUSE].concat(nnOrder.map(function(s){return s.geocoded;})).concat([NCS_WAREHOUSE]);
+        var nnRoute = await osrmRoute(nnCoords);
+
+        if (nnRoute) {
+          setTripResult({distanceKm:nnRoute.distanceKm,durationSec:nnRoute.durationSec});
+          if(nnRoute.geometry) setTripGeometry(nnRoute.geometry);
+          setOptimizedOrder(nnOrder);
+        } else {
+          setEstimated(true); setGlobalError(t("errOSRM"));
+          var d=0; for(var i=0;i<nnCoords.length-1;i++) d+=hvKm(nnCoords[i],nnCoords[i+1])*1.3;
+          var km=parseFloat(d.toFixed(1));
+          setTripResult({distanceKm:km,durationSec:Math.round((km/70)*3600)});
+          setOptimizedOrder(nnOrder);
+        }
+      } else {
+        // SHORTEST TOTAL: OSRM trip optimizer
+        var allCoords=[NCS_WAREHOUSE,...valid.map(s=>s.geocoded),NCS_WAREHOUSE];
+        var trip=await osrmTrip(allCoords);
+        if(trip){
+          setTripResult({distanceKm:trip.distanceKm,durationSec:trip.durationSec});
+          setTripGeometry(trip.geometry);
+          var wpIdx=trip.waypoints.slice(1,-1).map(function(wp){return wp.waypoint_index-1;});
+          var reord=wpIdx.map(function(i){return valid[i];}).filter(Boolean);
+          setOptimizedOrder(reord.length>0?reord:valid);
+        } else {
+          setEstimated(true); setGlobalError(t("errOSRM"));
+          var d2=0; for(var j=0;j<allCoords.length-1;j++) d2+=hvKm(allCoords[j],allCoords[j+1])*1.3;
+          var km2=parseFloat(d2.toFixed(1));
+          setTripResult({distanceKm:km2,durationSec:Math.round((km2/70)*3600)});
+          setOptimizedOrder(valid);
+        }
       }
+
+      // Set sequential comparison
+      if(seqRoute){setUnoptResult({distanceKm:seqRoute.distanceKm,durationSec:seqRoute.durationSec});if(seqRoute.geometry)setUnoptGeometry(seqRoute.geometry);}
+      else{var d3=0;for(var k=0;k<seqCoords.length-1;k++)d3+=hvKm(seqCoords[k],seqCoords[k+1])*1.3;setUnoptResult({distanceKm:parseFloat(d3.toFixed(1)),durationSec:Math.round((d3/70)*3600)});}
+
     }catch(err){console.error(err);setGlobalError(t("errNetwork"));}
     finally{setLoading(false);}
-  },[stops,lang]);
+  },[stops,lang,routeMode]);
 
   const calc=useMemo(()=>{
     if(!tripResult)return null;
@@ -353,6 +401,21 @@ function RouteMaster(){
               <input type="number" step="0.01" value={diesel} onChange={function(e){setDiesel(e.target.value);}} className={iCls}/>
             </div>
 
+            {/* Route Mode */}
+            <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4 backdrop-blur-sm">
+              <div className="flex items-center gap-2 mb-3"><Icon name="route" size={15} className="text-orange-500"/><span className="text-xs font-semibold uppercase tracking-widest text-slate-300">{lang==="en"?"Delivery Mode":"Liefermodus"}</span></div>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={function(){setRouteMode("nearest");}} className={"p-3 rounded-lg border text-left transition-all "+(routeMode==="nearest"?"border-orange-500/50 bg-orange-500/10":"border-slate-700/40 bg-slate-800/30 hover:border-slate-600")}>
+                  <div className="flex items-center gap-2 mb-1"><Icon name="map-pin" size={14} className={routeMode==="nearest"?"text-orange-400":"text-slate-500"}/><span className={"text-sm font-semibold "+(routeMode==="nearest"?"text-orange-400":"text-slate-300")}>{lang==="en"?"Nearest Next":"Nächster Stopp"}</span></div>
+                  <div className="text-[10px] text-slate-500">{lang==="en"?"No drive-pasts. Always delivers to closest stop next. Best for customer service.":"Kein Vorbeifahren. Immer zum nächsten Stopp. Bester Kundenservice."}</div>
+                </button>
+                <button onClick={function(){setRouteMode("shortest");}} className={"p-3 rounded-lg border text-left transition-all "+(routeMode==="shortest"?"border-orange-500/50 bg-orange-500/10":"border-slate-700/40 bg-slate-800/30 hover:border-slate-600")}>
+                  <div className="flex items-center gap-2 mb-1"><Icon name="trending-down" size={14} className={routeMode==="shortest"?"text-orange-400":"text-slate-500"}/><span className={"text-sm font-semibold "+(routeMode==="shortest"?"text-orange-400":"text-slate-300")}>{lang==="en"?"Shortest Total":"Kürzeste Strecke"}</span></div>
+                  <div className="text-[10px] text-slate-500">{lang==="en"?"Minimum total km. May skip nearby stops to save distance. Best for fuel savings.":"Minimale Gesamtstrecke. Kann nahe Stopps überspringen. Bestes Kraftstoffsparen."}</div>
+                </button>
+              </div>
+            </div>
+
             <button onClick={handleOptimize} disabled={loading} className={"w-full py-3.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all "+(loading?"bg-slate-700 text-slate-400 cursor-wait":"bg-gradient-to-r from-orange-500 to-orange-600 text-white hover:from-orange-600 hover:to-orange-700 shadow-lg shadow-orange-500/20 active:scale-[0.98]")}>
               {loading?<><Icon name="loader-2" size={16} className="anim-spin"/> {t("optimizing")}</>:<><Icon name="play" size={16}/> {t("optimize")}</>}
             </button>
@@ -362,7 +425,7 @@ function RouteMaster(){
           {/* RIGHT */}
           <div className="lg:col-span-7 space-y-4 fade-in" style={{animationDelay:"0.3s"}}>
             <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 backdrop-blur-sm overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-700/40 flex items-center gap-2"><Icon name="navigation" size={14} className="text-orange-500"/><span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">{lang==="en"?"Route Map":"Routenkarte"}</span>{optimizedOrder&&optimizedOrder.length>0&&<span className="ml-auto flex items-center gap-3 text-[9px]"><span className="flex items-center gap-1"><span style={{width:16,height:3,background:"#f97316",borderRadius:2,display:"inline-block"}}></span><span className="text-orange-400">Optimized</span></span><span className="flex items-center gap-1"><span style={{width:16,height:3,background:"#64748b",borderRadius:2,display:"inline-block",borderTop:"1px dashed #64748b"}}></span><span className="text-slate-500">Sequential</span></span></span>}{estimated&&<span className="ml-auto px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/25 text-[8px] font-bold uppercase text-amber-400">{t("estimated")}</span>}</div>
+              <div className="px-4 py-3 border-b border-slate-700/40 flex items-center gap-2"><Icon name="navigation" size={14} className="text-orange-500"/><span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">{lang==="en"?"Route Map":"Routenkarte"}</span>{estimated&&<span className="ml-auto px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/25 text-[8px] font-bold uppercase text-amber-400">{t("estimated")}</span>}</div>
               <LeafletMap stops={stops} optimizedOrder={optimizedOrder} tripGeometry={tripGeometry} unoptGeometry={unoptGeometry} depot={NCS_WAREHOUSE}/>
             </div>
 
@@ -384,7 +447,7 @@ function RouteMaster(){
                     <div className="px-4 py-3 border-b border-orange-500/20 bg-orange-500/5 flex items-center gap-2">
                       <Icon name="route" size={14} className="text-orange-400"/>
                       <span className="text-xs font-bold uppercase tracking-widest text-orange-400">{lang==="en"?"Driver Route Instructions":"Fahreranweisungen"}</span>
-                      <span className="ml-auto text-[9px] font-mono text-slate-500">{optimizedOrder.length+2} {lang==="en"?"stops":"Stopps"}</span>
+                      <span className="ml-auto flex items-center gap-2"><span className={"px-2 py-0.5 rounded text-[9px] font-bold uppercase "+(routeMode==="nearest"?"bg-emerald-500/15 border border-emerald-500/25 text-emerald-400":"bg-blue-500/15 border border-blue-500/25 text-blue-400")}>{routeMode==="nearest"?(lang==="en"?"Nearest Next":"Nächster Stopp"):(lang==="en"?"Shortest Total":"Kürzeste")}</span><span className="text-[9px] font-mono text-slate-500">{optimizedOrder.length+2} {lang==="en"?"stops":"Stopps"}</span></span>
                     </div>
                     <div className="p-0">
                       {/* Start */}
