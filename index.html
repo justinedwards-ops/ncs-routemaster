@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NCS RouteMaster — Multi-Stop Delivery Optimizer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/lucide@0.383.0/dist/umd/lucide.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+body{margin:0;font-family:'DM Sans',system-ui,sans-serif}
+.font-mono{font-family:'JetBrains Mono',ui-monospace,monospace}
+.fade-in{animation:fadeIn .5s ease-out forwards;opacity:0}
+@keyframes fadeIn{to{opacity:1}}
+.slide-up{animation:slideUp .6s cubic-bezier(.16,1,.3,1) forwards;opacity:0;transform:translateY(20px)}
+@keyframes slideUp{to{opacity:1;transform:translateY(0)}}
+.glow-line{background:linear-gradient(90deg,transparent,#f97316,transparent);height:1px}
+@keyframes spin{to{transform:rotate(360deg)}}.anim-spin{animation:spin .8s linear infinite}
+@keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(16,185,129,.15)}50%{box-shadow:0 0 16px 4px rgba(16,185,129,.1)}}
+.savings-pulse{animation:pulseGlow 3s ease-in-out infinite}
+input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none}
+input[type=number]{-moz-appearance:textfield}
+.leaflet-container{background:#0d1117!important}
+/* Style the new Google PlaceAutocompleteElement */
+gmp-placeautocomplete{width:100%;display:block}
+gmp-placeautocomplete::part(input){
+  width:100%;background:rgba(30,41,59,.6);border:1px solid rgba(100,116,139,.5);border-radius:0.5rem;
+  padding:0.625rem 1rem;color:#f1f5f9;font-size:13px;font-family:'DM Sans',sans-serif;
+  outline:none;transition:all .15s;
+}
+gmp-placeautocomplete::part(input):focus{
+  border-color:rgba(249,115,22,.7);box-shadow:0 0 0 1px rgba(249,115,22,.3);
+}
+gmp-placeautocomplete::part(input)::placeholder{color:#64748b}
+gmp-placeautocomplete::part(panel){
+  background:#1e293b;border:1px solid rgba(100,116,139,.4);border-radius:8px;
+  margin-top:4px;box-shadow:0 10px 40px rgba(0,0,0,.5);
+}
+gmp-placeautocomplete::part(prediction-item){
+  padding:8px 12px;color:#cbd5e1;cursor:pointer;font-size:13px;
+  border-top:1px solid rgba(51,65,85,.5);
+}
+gmp-placeautocomplete::part(prediction-item):hover,
+gmp-placeautocomplete::part(prediction-item-selected){background:rgba(249,115,22,.1)}
+gmp-placeautocomplete::part(prediction-item-main-text){color:#f1f5f9;font-weight:600}
+gmp-placeautocomplete::part(prediction-item-match){color:#f97316}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+var GOOGLE_API_KEY="AIzaSyByWHSRrCqSJZMAZ2GByvo_T0EEyV0kZVY";
+var googleMapsReady=new Promise(function(resolve){
+  window.__gmReady=function(){resolve(window.google.maps);};
+});
+var gs=document.createElement("script");
+gs.src="https://maps.googleapis.com/maps/api/js?key="+GOOGLE_API_KEY+"&libraries=places&callback=__gmReady&v=weekly";
+gs.async=true;document.head.appendChild(gs);
+</script>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useRef,useMemo}=React;
+
+function Icon({name,size=16,className="",strokeWidth=1.8}){
+  const ref=useRef(null);
+  useEffect(()=>{if(!ref.current||!lucide.icons[name])return;ref.current.innerHTML="";const svg=lucide.createElement(lucide.icons[name]);svg.setAttribute("width",size);svg.setAttribute("height",size);svg.setAttribute("stroke-width",strokeWidth);ref.current.appendChild(svg);},[name,size,strokeWidth]);
+  return <span ref={ref} className={`inline-flex items-center justify-center ${className}`}/>;
+}
+
+const NCS_WAREHOUSE={lat:-28.746543784192166,lng:32.03505231808933,display:"44 Ceramic Curve, Alton North, Richards Bay"};
+const DEFAULT_DIESEL=25.35, MAX_STOPS=10, OSRM_TIMEOUT=15000;
+const VEHICLES = {
+  kia: { name: "Kia K2700 Workhorse", year: 2022, type: "1-Ton Dropside", consumption: 10.7, icon: "truck" },
+  faw: { name: "FAW 15.180FL", year: 2024, type: "8-Ton Dropside", consumption: 19.0, icon: "truck" },
+};
+const fmtZAR=(v)=>new Intl.NumberFormat("en-ZA",{style:"currency",currency:"ZAR",minimumFractionDigits:2}).format(v);
+const fmtDur=(s)=>{const h=Math.floor(s/3600),m=Math.round((s%3600)/60);return h>0?`${h}h ${m}min`:`${m} min`;};
+
+const T={
+  title:{en:"NCS RouteMaster",de:"NCS RouteMaster"},
+  subtitle:{en:"Multi-Stop Delivery Optimizer · Richards Bay",de:"Mehrstopp-Lieferoptimierung · Richards Bay"},
+  depot:{en:"Start / End Depot",de:"Start- / Endlager"},
+  addStop:{en:"Add Delivery Stop",de:"Lieferstopp hinzufügen"},
+  optimize:{en:"Optimize Route",de:"Route optimieren"},
+  optimizing:{en:"Optimizing…",de:"Optimiere…"},
+  clear:{en:"Clear All",de:"Alle löschen"},
+  fuelParams:{en:"Fuel Parameters",de:"Kraftstoffparameter"},
+  dieselPrice:{en:"Diesel Price (R/L)",de:"Dieselpreis (R/L)"},
+  fuelConsump:{en:"Consumption (L/100km)",de:"Verbrauch (L/100km)"},
+  totalDist:{en:"Total Distance",de:"Gesamtentfernung"},
+  totalTime:{en:"Estimated Time",de:"Geschätzte Zeit"},
+  totalFuel:{en:"Total Fuel Cost",de:"Gesamtkosten Kraftstoff"},
+  fuelUsed:{en:"Fuel Used",de:"Kraftstoffverbrauch"},
+  savings:{en:"Savings Analysis",de:"Einsparungsanalyse"},
+  unoptDist:{en:"Unoptimized Distance",de:"Nicht-optimierte Distanz"},
+  optDist:{en:"Optimized Distance",de:"Optimierte Distanz"},
+  distSaved:{en:"Distance Saved",de:"Distanz gespart"},
+  fuelSaved:{en:"Fuel Cost Saved",de:"Kraftstoffkosten gespart"},
+  timeSaved:{en:"Time Saved",de:"Zeitersparnis"},
+  deliveryOrder:{en:"Delivery Order",de:"Lieferreihenfolge"},
+  errMinStops:{en:"Add at least 2 delivery stops.",de:"Mindestens 2 Lieferstopps."},
+  errNotGeo:{en:"Please select each address from the dropdown suggestions.",de:"Bitte wählen Sie jede Adresse aus den Vorschlägen."},
+  errOSRM:{en:"Routing service timed out. Using estimated distances.",de:"Routing-Zeitüberschreitung. Geschätzte Distanzen."},
+  errNetwork:{en:"Network error. Please retry.",de:"Netzwerkfehler."},
+  noRoute:{en:"Add delivery stops and optimize to see results",de:"Lieferstopps hinzufügen und optimieren"},
+  annual:{en:"Annual (250 trips)",de:"Jährlich (250 Fahrten)"},
+  estimated:{en:"Estimated — routing unavailable",de:"Geschätzt — Routing nicht verfügbar"},
+};
+
+// ═══ NEW PlaceAutocompleteElement WRAPPER ═══
+function PlaceAutocomplete({onPlaceSelect, stopId}) {
+  const containerRef = useRef(null);
+  const elementRef = useRef(null);
+  const callbackRef = useRef(onPlaceSelect);
+  callbackRef.current = onPlaceSelect;
+
+  useEffect(function() {
+    var dead = false;
+    googleMapsReady.then(function(maps) {
+      if (dead || !containerRef.current || elementRef.current) return;
+      // Load places library, then use global google.maps.places
+      return maps.importLibrary("places").then(function() {
+        if (dead || !containerRef.current || elementRef.current) return;
+        console.log("Places library loaded. Available:", Object.keys(google.maps.places).filter(function(k){return k.indexOf("Autocomplete")!==-1;}));
+        var el = new google.maps.places.PlaceAutocompleteElement({
+          componentRestrictions: { country: ["za"] },
+        });
+        console.log("Element created:", el);
+        // Listen for both possible event names
+        function handleSelect(e) {
+          console.log("Event fired!", e.type, e);
+          var place = e.place || e.placePrediction;
+          console.log("Place object:", place);
+          if (!place) return;
+          if (typeof place.fetchFields === "function") {
+            place.fetchFields({ fields: ["displayName", "formattedAddress", "location"] }).then(function(result) {
+              var p = (result && result.place) ? result.place : place;
+              var loc = p.location || place.location;
+              if (loc) {
+                var lat = typeof loc.lat === "function" ? loc.lat() : loc.lat;
+                var lng = typeof loc.lng === "function" ? loc.lng() : loc.lng;
+                var dn = p.displayName || place.displayName || "";
+                if (typeof dn === "object" && dn.text) dn = dn.text;
+                callbackRef.current({ lat: lat, lng: lng, display: p.formattedAddress || place.formattedAddress || "", name: String(dn) });
+              }
+            }).catch(function(err) { console.error("fetchFields error:", err); });
+          } else if (place.toPlace && typeof place.toPlace === "function") {
+            var p2 = place.toPlace();
+            p2.fetchFields({ fields: ["displayName", "formattedAddress", "location"] }).then(function(result) {
+              var resolved = (result && result.place) ? result.place : p2;
+              var loc2 = resolved.location || p2.location;
+              if (loc2) {
+                var lat2 = typeof loc2.lat === "function" ? loc2.lat() : loc2.lat;
+                var lng2 = typeof loc2.lng === "function" ? loc2.lng() : loc2.lng;
+                var dn2 = resolved.displayName || p2.displayName || "";
+                if (typeof dn2 === "object" && dn2.text) dn2 = dn2.text;
+                callbackRef.current({ lat: lat2, lng: lng2, display: resolved.formattedAddress || "", name: String(dn2) });
+              }
+            }).catch(function(err) { console.error("toPlace fetchFields error:", err); });
+          }
+        }
+        el.addEventListener("gmp-placeselect", handleSelect);
+        el.addEventListener("gmp-select", handleSelect);
+        containerRef.current.innerHTML = "";
+        containerRef.current.appendChild(el);
+        elementRef.current = el;
+      });
+    }).catch(function(err) { console.error("Google Maps load error:", err); });
+    return function() { dead = true; };
+  }, []);
+
+  return <div ref={containerRef} className="flex-1" />;
+}
+
+// ═══ OSRM WITH TIMEOUT ═══
+function fetchTO(url,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(url,{signal:c.signal}).finally(()=>clearTimeout(t));}
+
+async function osrmTrip(coords){
+  const cs=coords.map(c=>`${c.lng},${c.lat}`).join(";");
+  try{const res=await fetchTO(`https://router.project-osrm.org/trip/v1/driving/${cs}?source=first&destination=last&roundtrip=true&geometries=geojson&overview=full&steps=false`,OSRM_TIMEOUT);if(!res.ok)return null;const d=await res.json();if(d.code!=="Ok"||!d.trips||!d.trips.length)return null;const t=d.trips[0];return{distanceKm:parseFloat((t.distance/1000).toFixed(1)),durationSec:Math.round(t.duration),geometry:t.geometry,waypoints:d.waypoints};}catch(e){return null;}
+}
+async function osrmRoute(coords){
+  const cs=coords.map(c=>`${c.lng},${c.lat}`).join(";");
+  try{const res=await fetchTO(`https://router.project-osrm.org/route/v1/driving/${cs}?overview=full&geometries=geojson&steps=false`,OSRM_TIMEOUT);if(!res.ok)return null;const d=await res.json();if(d.code!=="Ok"||!d.routes||!d.routes.length)return null;return{distanceKm:parseFloat((d.routes[0].distance/1000).toFixed(1)),durationSec:Math.round(d.routes[0].duration),geometry:d.routes[0].geometry};}catch(e){return null;}
+}
+function hvKm(a,b){const R=6371,dLat=((b.lat-a.lat)*Math.PI)/180,dLon=((b.lng-a.lng)*Math.PI)/180;const x=Math.sin(dLat/2)**2+Math.cos((a.lat*Math.PI)/180)*Math.cos((b.lat*Math.PI)/180)*Math.sin(dLon/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));}
+
+// ═══ LEAFLET MAP ═══
+function LeafletMap({stops,optimizedOrder,tripGeometry,unoptGeometry,depot}){
+  const mapRef=useRef(null),mapInst=useRef(null),lg=useRef(null);
+  useEffect(()=>{if(mapInst.current||!mapRef.current)return;const L=window.L;const map=L.map(mapRef.current,{center:[depot.lat,depot.lng],zoom:10,attributionControl:false});L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);mapInst.current=map;lg.current=L.layerGroup().addTo(map);return()=>{map.remove();mapInst.current=null;};},[]);
+  useEffect(()=>{
+    if(!mapInst.current||!lg.current)return;const L=window.L;lg.current.clearLayers();
+    const mkI=(html)=>L.divIcon({html,className:"",iconSize:[30,30],iconAnchor:[15,15]});
+    L.marker([depot.lat,depot.lng],{icon:mkI('<div style="width:30px;height:30px;border-radius:50%;background:#f97316;border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#fff;box-shadow:0 2px 10px rgba(249,115,22,.6)">D</div>')}).addTo(lg.current);
+    const bounds=[[depot.lat,depot.lng]];
+    const list=optimizedOrder&&optimizedOrder.length>0?optimizedOrder:stops;
+    const isOpt=optimizedOrder&&optimizedOrder.length>0;
+    list.forEach((s,i)=>{if(!s.geocoded)return;const c=isOpt?"#10b981":"#475569";L.marker([s.geocoded.lat,s.geocoded.lng],{icon:mkI(`<div style="width:30px;height:30px;border-radius:50%;background:${c};border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.4)">${isOpt?i+1:"?"}</div>`)}).addTo(lg.current);bounds.push([s.geocoded.lat,s.geocoded.lng]);});
+    if(isOpt&&unoptGeometry&&unoptGeometry.coordinates)L.polyline(unoptGeometry.coordinates.map(c=>[c[1],c[0]]),{color:"#64748b",weight:3,opacity:0.5,dashArray:"8 6"}).addTo(lg.current);
+    if(isOpt&&tripGeometry&&tripGeometry.coordinates)L.polyline(tripGeometry.coordinates.map(c=>[c[1],c[0]]),{color:"#f97316",weight:4,opacity:0.85}).addTo(lg.current);
+    if(bounds.length>1)mapInst.current.fitBounds(bounds,{padding:[50,50],maxZoom:13});
+  },[stops,optimizedOrder,tripGeometry,unoptGeometry,depot]);
+  return <div ref={mapRef} className="w-full rounded-lg overflow-hidden border border-slate-700/50" style={{height:400,background:"#0d1117"}}/>;
+}
+
+// ═══ MAIN ═══
+function RouteMaster(){
+  const [lang,setLang]=useState("en");const t=(k)=>T[k]?.[lang]||k;
+  const [stops,setStops]=useState([{id:1,geocoded:null},{id:2,geocoded:null}]);
+  const [nextId,setNextId]=useState(3);
+  const [vehicle, setVehicle] = useState("kia");
+  const [diesel, setDiesel] = useState(DEFAULT_DIESEL);
+  const [loading,setLoading]=useState(false);
+  const [globalError,setGlobalError]=useState(null);
+  const [tripResult,setTripResult]=useState(null);
+  const [unoptResult,setUnoptResult]=useState(null);
+  const [optimizedOrder,setOptimizedOrder]=useState(null);
+  const [tripGeometry,setTripGeometry]=useState(null);
+  const [unoptGeometry,setUnoptGeometry]=useState(null);
+  const [estimated,setEstimated]=useState(false);
+  const [mounted,setMounted]=useState(false);
+  useEffect(()=>{setMounted(true);},[]);
+
+  const addStop=()=>{if(stops.length>=MAX_STOPS)return;setStops(s=>[...s,{id:nextId,geocoded:null}]);setNextId(n=>n+1);};
+  const removeStop=(id)=>{if(stops.length<=2)return;setStops(s=>s.filter(x=>x.id!==id));};
+  const setGeo=(id,geo)=>setStops(s=>s.map(x=>x.id===id?{...x,geocoded:geo}:x));
+
+  const clearAll=()=>{
+    setStops([{id:nextId,geocoded:null},{id:nextId+1,geocoded:null}]);
+    setNextId(n=>n+2);setTripResult(null);setUnoptResult(null);setOptimizedOrder(null);setTripGeometry(null);setUnoptGeometry(null);setGlobalError(null);setEstimated(false);
+  };
+
+  const handleOptimize=useCallback(async()=>{
+    const valid=stops.filter(s=>s.geocoded);
+    if(valid.length<2){setGlobalError(t("errNotGeo"));return;}
+    setLoading(true);setGlobalError(null);setTripResult(null);setUnoptResult(null);setOptimizedOrder(null);setTripGeometry(null);setUnoptGeometry(null);setEstimated(false);
+    const all=[NCS_WAREHOUSE,...valid.map(s=>s.geocoded),NCS_WAREHOUSE];
+    try{
+      const trip=await osrmTrip(all);
+      const unopt=await osrmRoute(all);
+      if(trip){
+        setTripResult({distanceKm:trip.distanceKm,durationSec:trip.durationSec});
+        setTripGeometry(trip.geometry);
+        const wpIdx=trip.waypoints.slice(1,-1).map(wp=>wp.waypoint_index-1);
+        const reord=wpIdx.map(i=>valid[i]).filter(Boolean);
+        setOptimizedOrder(reord.length>0?reord:valid);
+        if(unopt){setUnoptResult({distanceKm:unopt.distanceKm,durationSec:unopt.durationSec});if(unopt.geometry)setUnoptGeometry(unopt.geometry);}
+        else{let d=0;for(let i=0;i<all.length-1;i++)d+=hvKm(all[i],all[i+1])*1.3;setUnoptResult({distanceKm:parseFloat(d.toFixed(1)),durationSec:Math.round((d/70)*3600)});}
+      }else{
+        setEstimated(true);setGlobalError(t("errOSRM"));
+        let d=0;for(let i=0;i<all.length-1;i++)d+=hvKm(all[i],all[i+1])*1.3;const km=parseFloat(d.toFixed(1));
+        setTripResult({distanceKm:km,durationSec:Math.round((km/70)*3600)});
+        setOptimizedOrder(valid);
+        setUnoptResult({distanceKm:parseFloat((km*1.2).toFixed(1)),durationSec:Math.round(((km*1.2)/70)*3600)});
+      }
+    }catch(err){console.error(err);setGlobalError(t("errNetwork"));}
+    finally{setLoading(false);}
+  },[stops,lang]);
+
+  const calc=useMemo(()=>{
+    if(!tripResult)return null;
+    const dp=parseFloat(diesel)||DEFAULT_DIESEL,fc=VEHICLES[vehicle].consumption;
+    const oKm=tripResult.distanceKm,oL=(oKm*fc)/100,oCost=oL*dp;
+    const uKm=unoptResult?unoptResult.distanceKm:oKm*1.25,uL=(uKm*fc)/100,uCost=uL*dp;
+    const uDur=unoptResult?unoptResult.durationSec:tripResult.durationSec*1.25;
+    const kmS=Math.max(0,uKm-oKm),cS=Math.max(0,uCost-oCost),tS=Math.max(0,uDur-tripResult.durationSec);
+    return{oKm,oL,oCost,oDur:tripResult.durationSec,uKm,uCost,uDur,kmS,cS,tS,pct:uKm>0?(kmS/uKm)*100:0,ann:cS*250};
+  },[tripResult,unoptResult,diesel,vehicle]);
+
+  const iCls="w-full bg-slate-800/60 border border-slate-600/50 rounded-lg px-4 py-3 text-slate-100 placeholder-slate-500 focus:outline-none focus:border-orange-500/70 focus:ring-1 focus:ring-orange-500/30 transition-all text-sm";
+  const lCls="text-[11px] font-semibold uppercase tracking-[0.15em] text-slate-400 mb-1.5 flex items-center gap-1.5";
+
+  return (
+    <div className="min-h-screen text-slate-100" style={{background:"linear-gradient(165deg,#0a0f1c 0%,#101829 40%,#0d1520 100%)"}}>
+      <header className="relative overflow-hidden">
+        <div className="absolute inset-0" style={{background:"radial-gradient(ellipse 80% 50% at 20% 0%,rgba(249,115,22,.08),transparent 70%),radial-gradient(ellipse 60% 40% at 80% 0%,rgba(16,185,129,.05),transparent 60%)"}}/>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-6 relative">
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-orange-600 flex items-center justify-center shadow-lg shadow-orange-500/20"><Icon name="factory" size={20} className="text-white"/></div>
+              <div><div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-semibold">NCS · Steel Logistics</div><div className="text-[9px] uppercase tracking-[0.15em] text-slate-600 flex items-center gap-1 mt-0.5"><Icon name="shield" size={9}/> Google Places · OSRM Optimization</div></div>
+            </div>
+            <button onClick={()=>setLang(lang==="en"?"de":"en")} className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-700/60 bg-slate-800/40 hover:border-orange-500/40 transition-all text-xs font-medium text-slate-400 hover:text-orange-400"><Icon name="globe" size={13}/>{lang==="en"?"DE":"EN"}</button>
+          </div>
+          <div className={mounted?"slide-up":""}><h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white mb-1">{t("title")}</h1><p className="text-sm text-slate-400">{t("subtitle")}</p></div>
+          <div className="glow-line w-full mt-4"/>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 pb-12 -mt-1">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <div className="lg:col-span-5 space-y-4 fade-in" style={{animationDelay:"0.15s"}}>
+            {/* Depot */}
+            <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4 backdrop-blur-sm">
+              <div className="flex items-center gap-2 mb-3"><div className="w-6 h-6 rounded-full bg-orange-500 flex items-center justify-center text-[10px] font-bold text-white">D</div><span className="text-xs font-semibold uppercase tracking-widest text-slate-300">{t("depot")}</span></div>
+              <div className="px-4 py-3 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center gap-3"><Icon name="map-pin" size={16} className="text-orange-400"/><div><div className="text-sm font-semibold text-orange-400">44 Ceramic Curve, Richards Bay</div><div className="text-[10px] font-mono text-slate-500">{NCS_WAREHOUSE.lat.toFixed(5)}, {NCS_WAREHOUSE.lng.toFixed(5)}</div></div></div>
+            </div>
+
+            {/* Stops */}
+            <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2"><Icon name="route" size={15} className="text-orange-500"/><span className="text-xs font-semibold uppercase tracking-widest text-slate-300">{lang==="en"?"Delivery Stops":"Lieferstopps"} ({stops.length}/{MAX_STOPS})</span></div>
+                <button onClick={clearAll} className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all"><Icon name="rotate-ccw" size={10}/> {t("clear")}</button>
+              </div>
+              <div className="space-y-3">
+                {stops.map((stop,idx)=>(
+                  <div key={stop.id} className="group">
+                    <div className="flex items-center gap-2">
+                      <div className={"w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 "+(stop.geocoded?"bg-emerald-500 text-white":"bg-emerald-500/20 border border-emerald-500/30 text-emerald-400")}>{idx+1}</div>
+                      <PlaceAutocomplete stopId={stop.id} onPlaceSelect={(geo)=>setGeo(stop.id,geo)} />
+                      {stops.length>2&&<button onClick={()=>removeStop(stop.id)} className="p-1.5 rounded text-slate-600 hover:text-red-400 hover:bg-red-500/10 transition-all opacity-0 group-hover:opacity-100"><Icon name="x" size={14}/></button>}
+                    </div>
+                    {stop.geocoded&&(
+                      <div className="ml-8 mt-1.5 text-[10px] text-emerald-400/70 flex items-center gap-1 truncate">
+                        <Icon name="circle-check" size={10}/>
+                        <span className="font-mono">{stop.geocoded.lat.toFixed(5)}, {stop.geocoded.lng.toFixed(5)}</span>
+                        <span className="text-slate-600 mx-1">·</span>
+                        <span className="truncate">{stop.geocoded.display}</span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {stops.length<MAX_STOPS&&<button onClick={addStop} className="mt-3 w-full py-2.5 rounded-lg border border-dashed border-slate-600/50 text-slate-500 hover:border-orange-500/40 hover:text-orange-400 hover:bg-orange-500/5 transition-all flex items-center justify-center gap-2 text-xs font-medium"><Icon name="plus" size={14}/> {t("addStop")}</button>}
+            </div>
+
+            {/* Vehicle & Fuel */}
+            <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4 backdrop-blur-sm">
+              <div className="flex items-center gap-2 mb-3"><Icon name="truck" size={15} className="text-orange-500"/><span className="text-xs font-semibold uppercase tracking-widest text-slate-300">{lang==="en"?"Vehicle & Fuel":"Fahrzeug & Kraftstoff"}</span></div>
+              <label className={lCls}><Icon name="truck" size={10}/> {lang==="en"?"Select Vehicle":"Fahrzeug wählen"}</label>
+              <div className="grid grid-cols-1 gap-2 mb-3">
+                {Object.entries(VEHICLES).map(function(entry){var key=entry[0],v=entry[1]; var active=vehicle===key; return (
+                  <button key={key} onClick={function(){setVehicle(key);}} className={"p-3 rounded-lg border text-left transition-all "+(active?"border-orange-500/50 bg-orange-500/10":"border-slate-700/40 bg-slate-800/30 hover:border-slate-600")}>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className={"text-sm font-semibold "+(active?"text-orange-400":"text-slate-300")}>{v.name}</div>
+                        <div className="text-[10px] text-slate-500 font-mono">{v.year} · {v.type} · Diesel</div>
+                      </div>
+                      <div className="text-right">
+                        <div className={"text-sm font-bold font-mono "+(active?"text-orange-400":"text-slate-400")}>{v.consumption} L</div>
+                        <div className="text-[9px] text-slate-500">per 100km</div>
+                      </div>
+                    </div>
+                  </button>
+                );})}
+              </div>
+              <label className={lCls}><Icon name="dollar-sign" size={10}/> {t("dieselPrice")}</label>
+              <input type="number" step="0.01" value={diesel} onChange={function(e){setDiesel(e.target.value);}} className={iCls}/>
+            </div>
+
+            <button onClick={handleOptimize} disabled={loading} className={"w-full py-3.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all "+(loading?"bg-slate-700 text-slate-400 cursor-wait":"bg-gradient-to-r from-orange-500 to-orange-600 text-white hover:from-orange-600 hover:to-orange-700 shadow-lg shadow-orange-500/20 active:scale-[0.98]")}>
+              {loading?<><Icon name="loader-2" size={16} className="anim-spin"/> {t("optimizing")}</>:<><Icon name="play" size={16}/> {t("optimize")}</>}
+            </button>
+            {globalError&&<div className={"px-3 py-2 rounded-lg flex items-start gap-2 text-sm "+(estimated?"bg-amber-500/10 border border-amber-500/20 text-amber-400":"bg-red-500/10 border border-red-500/20 text-red-400")}><Icon name="triangle-alert" size={14} className="mt-0.5 shrink-0"/> {globalError}</div>}
+          </div>
+
+          {/* RIGHT */}
+          <div className="lg:col-span-7 space-y-4 fade-in" style={{animationDelay:"0.3s"}}>
+            <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 backdrop-blur-sm overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-700/40 flex items-center gap-2"><Icon name="navigation" size={14} className="text-orange-500"/><span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">{lang==="en"?"Route Map":"Routenkarte"}</span>{optimizedOrder&&optimizedOrder.length>0&&<span className="ml-auto flex items-center gap-3 text-[9px]"><span className="flex items-center gap-1"><span style={{width:16,height:3,background:"#f97316",borderRadius:2,display:"inline-block"}}></span><span className="text-orange-400">Optimized</span></span><span className="flex items-center gap-1"><span style={{width:16,height:3,background:"#64748b",borderRadius:2,display:"inline-block",borderTop:"1px dashed #64748b"}}></span><span className="text-slate-500">Sequential</span></span></span>}{estimated&&<span className="ml-auto px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/25 text-[8px] font-bold uppercase text-amber-400">{t("estimated")}</span>}</div>
+              <LeafletMap stops={stops} optimizedOrder={optimizedOrder} tripGeometry={tripGeometry} unoptGeometry={unoptGeometry} depot={NCS_WAREHOUSE}/>
+            </div>
+
+            {!calc?(
+              <div className="rounded-xl border border-slate-700/30 bg-slate-900/30 p-12 flex flex-col items-center justify-center text-center"><Icon name="target" size={36} className="text-slate-700 mb-3"/><p className="text-slate-500 text-sm">{t("noRoute")}</p></div>
+            ):(
+              <>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {[{l:t("totalDist"),v:`${calc.oKm.toLocaleString("en-ZA")} km`,i:"route",c:"orange"},{l:t("totalTime"),v:fmtDur(calc.oDur),i:"clock",c:"slate"},{l:t("fuelUsed"),v:`${calc.oL.toFixed(1)} L`,i:"fuel",c:"slate"},{l:t("totalFuel"),v:fmtZAR(calc.oCost),i:"dollar-sign",c:"orange"}].map((x,i)=>(
+                    <div key={i} className={`px-3 py-3 rounded-lg border ${x.c==="orange"?"bg-orange-500/10 border-orange-500/20":"bg-slate-800/60 border-slate-700/50"}`}>
+                      <div className="flex items-center gap-1.5 mb-1"><Icon name={x.i} size={14} className={x.c==="orange"?"text-orange-400":"text-slate-500"}/><span className="text-[9px] uppercase tracking-widest text-slate-500">{x.l}</span></div>
+                      <div className={`text-lg font-bold font-mono ${x.c==="orange"?"text-orange-400":"text-slate-200"}`}>{x.v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {optimizedOrder&&optimizedOrder.length>0&&(
+                  <div className="rounded-xl border border-orange-500/30 bg-slate-900/50 backdrop-blur-sm overflow-hidden">
+                    <div className="px-4 py-3 border-b border-orange-500/20 bg-orange-500/5 flex items-center gap-2">
+                      <Icon name="route" size={14} className="text-orange-400"/>
+                      <span className="text-xs font-bold uppercase tracking-widest text-orange-400">{lang==="en"?"Driver Route Instructions":"Fahreranweisungen"}</span>
+                      <span className="ml-auto text-[9px] font-mono text-slate-500">{optimizedOrder.length+2} {lang==="en"?"stops":"Stopps"}</span>
+                    </div>
+                    <div className="p-0">
+                      {/* Start */}
+                      <div className="flex items-start gap-3 px-4 py-3 border-b border-slate-800/60">
+                        <div className="flex flex-col items-center">
+                          <div className="w-8 h-8 rounded-full bg-orange-500 flex items-center justify-center text-xs font-bold text-white shadow-lg shadow-orange-500/30">S</div>
+                          <div className="w-0.5 h-full bg-slate-700 mt-1"></div>
+                        </div>
+                        <div className="flex-1 pt-1">
+                          <div className="text-[10px] uppercase tracking-widest text-orange-400 font-semibold mb-0.5">{lang==="en"?"START — Leave Depot":"START — Depot verlassen"}</div>
+                          <div className="text-sm text-white font-medium">44 Ceramic Curve, Richards Bay</div>
+                        </div>
+                      </div>
+                      {/* Stops */}
+                      {optimizedOrder.map(function(s,i){return(
+                        <div key={s.id} className="flex items-start gap-3 px-4 py-3 border-b border-slate-800/60 hover:bg-emerald-500/5 transition-colors">
+                          <div className="flex flex-col items-center">
+                            <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center text-sm font-bold text-white shadow-lg shadow-emerald-500/30">{i+1}</div>
+                            {i<optimizedOrder.length-1&&<div className="w-0.5 h-full bg-slate-700 mt-1"></div>}
+                          </div>
+                          <div className="flex-1 pt-1">
+                            <div className="text-[10px] uppercase tracking-widest text-emerald-400 font-semibold mb-0.5">{lang==="en"?"STOP":"STOPP"} {i+1} {lang==="en"?"of":"von"} {optimizedOrder.length}</div>
+                            {s.geocoded&&s.geocoded.name&&<div className="text-base text-white font-bold">{s.geocoded.name}</div>}
+                            <div className={"text-slate-400 "+(s.geocoded&&s.geocoded.name?"text-xs":"text-sm font-medium text-white")}>{s.geocoded?s.geocoded.display:"Stop "+(i+1)}</div>
+                            {s.geocoded&&<div className="text-[10px] font-mono text-slate-500 mt-0.5">{s.geocoded.lat.toFixed(5)}, {s.geocoded.lng.toFixed(5)}</div>}
+                          </div>
+                          <div className="shrink-0 pt-1"><Icon name="map-pin" size={16} className="text-emerald-400/50"/></div>
+                        </div>
+                      );})}
+                      {/* Return */}
+                      <div className="flex items-start gap-3 px-4 py-3">
+                        <div className="w-8 h-8 rounded-full bg-orange-500 flex items-center justify-center text-xs font-bold text-white shadow-lg shadow-orange-500/30">
+                          <Icon name="flag" size={14} className="text-white"/>
+                        </div>
+                        <div className="flex-1 pt-1">
+                          <div className="text-[10px] uppercase tracking-widest text-orange-400 font-semibold mb-0.5">{lang==="en"?"FINISH — Return to Depot":"ZIEL — Zurück zum Depot"}</div>
+                          <div className="text-sm text-white font-medium">44 Ceramic Curve, Richards Bay</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="rounded-xl border border-slate-700/50 bg-gradient-to-br from-slate-900/60 to-emerald-950/20 backdrop-blur-sm overflow-hidden savings-pulse">
+                  <div className="px-4 py-3 border-b border-slate-700/40 flex items-center gap-2"><Icon name="sparkles" size={14} className="text-emerald-400"/><span className="text-[10px] font-semibold uppercase tracking-widest text-emerald-300">{t("savings")}</span><span className="ml-auto text-[9px] font-mono text-slate-600 px-2 py-0.5 rounded bg-slate-800/60 border border-slate-700/40">{lang==="en"?"Sequential vs Optimized":"Sequenziell vs Optimiert"}</span></div>
+                  <div className="p-4">
+                    <div className="space-y-3 mb-5">
+                      <div><div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">{t("unoptDist")}</span><span className="font-mono text-slate-400">{calc.uKm.toLocaleString("en-ZA")} km</span></div><div className="h-2.5 rounded-full bg-slate-800 overflow-hidden"><div className="h-full rounded-full bg-slate-600" style={{width:"100%"}}/></div></div>
+                      <div><div className="flex justify-between text-[10px] mb-1"><span className="text-emerald-400">{t("optDist")}</span><span className="font-mono text-emerald-400">{calc.oKm.toLocaleString("en-ZA")} km</span></div><div className="h-2.5 rounded-full bg-slate-800 overflow-hidden"><div className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all duration-700" style={{width:`${calc.uKm>0?(calc.oKm/calc.uKm)*100:100}%`}}/></div></div>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      {[{l:t("distSaved"),v:`${calc.kmS.toFixed(1)} km`},{l:t("fuelSaved"),v:fmtZAR(calc.cS)},{l:t("timeSaved"),v:fmtDur(calc.tS)},{l:t("annual"),v:fmtZAR(calc.ann)}].map((x,i)=>(
+                        <div key={i} className="px-3 py-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20"><div className="text-[9px] uppercase tracking-widest text-emerald-500/60 mb-1">{x.l}</div><div className="text-base font-bold font-mono text-emerald-400">{x.v}</div></div>
+                      ))}
+                    </div>
+                    {calc.pct>0&&<div className="mt-3 text-right text-[10px] text-emerald-400/60 font-mono"><Icon name="trending-down" size={10} className="inline mr-1"/>{calc.pct.toFixed(1)}% {lang==="en"?"distance reduction":"Distanzreduzierung"}</div>}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </main>
+
+      <footer className="max-w-7xl mx-auto px-4 sm:px-6 pb-6"><div className="glow-line w-full mb-4 opacity-30"/><div className="flex flex-col sm:flex-row items-start sm:items-center justify-between text-[10px] text-slate-600 gap-2"><span>© 2026 NCS RouteMaster · Richards Bay, ZA</span><span>Google Places (New) · OSRM Trip API · Leaflet</span></div></footer>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<RouteMaster/>);
+</script>
+</body>
+</html>
